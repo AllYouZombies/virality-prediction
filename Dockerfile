@@ -16,8 +16,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # PyTorch nightly с CUDA 12.4 для поддержки новых GPU (compute capability 12.0)
-RUN pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu124 --no-deps && \
-    pip install numpy typing-extensions sympy networkx jinja2 fsspec filelock pillow
+RUN pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu130 --no-deps
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

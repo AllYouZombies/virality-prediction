@@ -1,14 +1,20 @@
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-# PyTorch устанавливается отдельно в Dockerfile
-einops>=0.7.0
-opencv-python>=4.9.0
-moviepy>=1.0.3
-numpy>=1.26.0
-Pillow>=10.2.0
-python-multipart>=0.0.9
-scikit-video>=1.1.11
-transformers>=4.37.0  # Для предобученных моделей HuggingFace
-accelerate>=0.27.0  # Для оптимизации GPU
-setuptools>=65.5.1  # Для совместимости с Python 3.12
-av>=10.0.0  # Для обработки видео в HuggingFace
+fastapi
+uvicorn[standard]
+einops
+opencv-python
+moviepy
+numpy
+Pillow
+python-multipart
+scikit-video
+transformers  # Для предобученных моделей HuggingFace (ViViT поддержка)
+accelerate  # Для оптимизации GPU
+setuptools  # Для совместимости с Python 3.12
+av  # Для обработки видео в HuggingFace
+numpy
+typing-extensions
+sympy
+networkx
+jinja2
+fsspec
+filelock
