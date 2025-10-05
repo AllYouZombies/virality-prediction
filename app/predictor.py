@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import VivitImageProcessor, VivitForVideoClassification
+from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
 from .video_processor import VideoProcessor
 import os
 import numpy as np
@@ -14,10 +14,10 @@ class ViralityPredictor:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
 
-        # Загружаем предобученную ViViT модель от Google
-        print("Загрузка HuggingFace ViViT модели...")
-        self.image_processor = VivitImageProcessor.from_pretrained("google/vivit-b-16x2-kinetics400")
-        base_model = VivitForVideoClassification.from_pretrained("google/vivit-b-16x2-kinetics400")
+        # Загружаем предобученную VideoMAE модель
+        print("Загрузка HuggingFace VideoMAE модели...")
+        self.image_processor = VideoMAEImageProcessor.from_pretrained("MCG-NJU/videomae-base-finetuned-kinetics")
+        base_model = VideoMAEForVideoClassification.from_pretrained("MCG-NJU/videomae-base-finetuned-kinetics")
 
         # Адаптируем под бинарную классификацию (вирусное/не вирусное)
         # Заменяем последний слой с 400 классов на 2
@@ -29,15 +29,15 @@ class ViralityPredictor:
         self.model.eval()
 
         # Инициализация процессора видео
-        # ViViT-B-16x2 ожидает 32 кадра
-        self.video_processor = VideoProcessor(target_frames=32)
+        # VideoMAE ожидает 16 кадров × 224×224
+        self.video_processor = VideoProcessor(target_frames=16, target_size=224)
 
         # Информация о GPU если доступен
         if torch.cuda.is_available():
             print(f"GPU: {torch.cuda.get_device_name(0)}")
             print(f"Память GPU: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
-        print("Модель загружена (предобученная ViViT с адаптацией под 2 класса)")
+        print("Модель загружена (предобученная VideoMAE с адаптацией под 2 класса)")
 
     def _create_demo_weights(self):
         """Создает демо-веса для модели"""
@@ -100,7 +100,7 @@ class ViralityPredictor:
                 'recommendations': recommendations,
                 'audio_features': audio_features,
                 'device_used': str(self.device),
-                'model_status': 'huggingface_pretrained'
+                'model_status': 'huggingface_videomae_pretrained'
             }
 
         except Exception as e:
