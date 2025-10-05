@@ -1,5 +1,7 @@
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
+WORKDIR /app
+
 RUN --mount=type=cache,target=/var/cache/apt \
     --mount=type=cache,target=/var/lib/apt \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -11,39 +13,22 @@ RUN --mount=type=cache,target=/var/cache/apt \
     libxext6 \
     libxrender-dev \
     libgomp1 \
-    curl \
-    && python3 -m venv /opt/venv
+    curl
 
-ENV PATH="/opt/venv/bin:$PATH"
-
-WORKDIR /app
-
-# СНАЧАЛА устанавливаем PyTorch nightly
+# Устанавливаем pipenv
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+    pip install pipenv
 
-# ЗАТЕМ устанавливаем остальные зависимости
-# PyTorch уже установлен, поэтому зависимости не будут тянуть стабильную версию
-RUN --mount=type=bind,source=requirements.txt,target=/app/requirements.txt \
-    --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir -r requirements.txt
+# Pipenv правильно разрешает зависимости с учетом источников
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=bind,source=./Pipfile.lock,target=/app/Pipfile.lock \
+    PIPENV_VENV_IN_PROJECT=1 pipenv install --deploy --ignore-pipfile
+
+# Активируем виртуальное окружение pipenv
+ENV PATH="/app/.venv/bin:$PATH"
 
 COPY app/ /app/app/
-COPY ViViT/ /app/ViViT/
 
-RUN mkdir -p /app/models /app/uploads
-
-COPY create_demo_model.py /app/
-
-RUN echo '#!/bin/bash\n\
-if [ ! -f /app/models/vivit_model.pth ]; then\n\
-    echo "Модель не найдена, создаем демо-модель..."\n\
-    python3 /app/create_demo_model.py\n\
-fi\n\
-python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000' > /app/entrypoint.sh
-
-RUN chmod +x /app/entrypoint.sh
+RUN mkdir -p /app/models
 
 EXPOSE 8000
-
-ENTRYPOINT ["/app/entrypoint.sh"]

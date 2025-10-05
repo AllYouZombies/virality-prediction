@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
+from transformers import VideoMAEForVideoClassification
 from .video_processor import VideoProcessor
 import os
 import numpy as np
@@ -16,7 +16,7 @@ class ViralityPredictor:
 
         # Загружаем предобученную VideoMAE модель
         print("Загрузка HuggingFace VideoMAE модели...")
-        self.image_processor = VideoMAEImageProcessor.from_pretrained("MCG-NJU/videomae-base-finetuned-kinetics")
+
         base_model = VideoMAEForVideoClassification.from_pretrained("MCG-NJU/videomae-base-finetuned-kinetics")
 
         # Адаптируем под бинарную классификацию (вирусное/не вирусное)
@@ -27,6 +27,9 @@ class ViralityPredictor:
         self.model = base_model
         self.model.to(self.device)
         self.model.eval()
+
+        # Процессор не нужен - используем ручную нормализацию
+        self.image_processor = None
 
         # Инициализация процессора видео
         # VideoMAE ожидает 16 кадров × 224×224
@@ -55,19 +58,22 @@ class ViralityPredictor:
             # Предобработка видео
             frames = self.video_processor.extract_frames(video_path)
 
-            # HuggingFace processor ожидает список numpy массивов
-            # frames shape: (num_frames, H, W, C)
-            inputs = self.image_processor(list(frames), return_tensors="pt")
-
-            # Переносим на device
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            frames_normalized = frames.astype(np.float32) / 255.0
+            # Переставляем размерности: (T, H, W, C) -> (T, C, H, W)
+            frames_tensor = torch.from_numpy(frames_normalized).permute(0, 3, 1, 2)
+            # Добавляем batch dimension: (T, C, H, W) -> (1, T, C, H, W)
+            frames_tensor = frames_tensor.unsqueeze(0).to(self.device)
+            # Нормализация ImageNet
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1).to(self.device)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1).to(self.device)
+            frames_tensor = (frames_tensor - mean) / std
 
             # Извлечение аудио характеристик
             audio_features = self.video_processor.extract_audio_features(video_path)
 
             # Предсказание
             with torch.no_grad():
-                outputs = self.model(**inputs)
+                outputs = self.model(pixel_values=frames_tensor)
                 logits = outputs.logits
                 probabilities = F.softmax(logits, dim=1)
 
@@ -148,15 +154,16 @@ class ViralityPredictor:
             dict: Результаты предсказания
         """
         try:
-            # HuggingFace processor ожидает список numpy массивов
-            inputs = self.image_processor(list(frames), return_tensors="pt")
-
-            # Переносим на device
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            frames_normalized = frames.astype(np.float32) / 255.0
+            frames_tensor = torch.from_numpy(frames_normalized).permute(0, 3, 1, 2)
+            frames_tensor = frames_tensor.unsqueeze(0).to(self.device)
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1).to(self.device)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1).to(self.device)
+            frames_tensor = (frames_tensor - mean) / std
 
             # Предсказание
             with torch.no_grad():
-                outputs = self.model(**inputs)
+                outputs = self.model(pixel_values=frames_tensor)
                 logits = outputs.logits
                 probabilities = F.softmax(logits, dim=1)
 
@@ -210,22 +217,23 @@ class ViralityPredictor:
             for i in range(0, len(frames_list), batch_size):
                 batch = frames_list[i:i + batch_size]
 
-                # Подготавливаем все фреймы в батче
-                batch_inputs = []
+                batch_tensors = []
                 for frames in batch:
-                    inputs = self.image_processor(list(frames), return_tensors="pt")
-                    batch_inputs.append(inputs)
+                    frames_normalized = frames.astype(np.float32) / 255.0
+                    frames_tensor = torch.from_numpy(frames_normalized).permute(0, 3, 1, 2)
+                    frames_tensor = frames_tensor.unsqueeze(0)
+                    batch_tensors.append(frames_tensor)
 
-                # Стакаем в один батч
-                # Все inputs должны иметь одинаковую размерность
-                stacked_inputs = {
-                    k: torch.cat([inp[k] for inp in batch_inputs], dim=0).to(self.device)
-                    for k in batch_inputs[0].keys()
-                }
+                # Стакаем батч
+                stacked_tensor = torch.cat(batch_tensors, dim=0).to(self.device)
+                # Нормализация ImageNet
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1).to(self.device)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1).to(self.device)
+                stacked_tensor = (stacked_tensor - mean) / std
 
                 # Предсказание для батча
                 with torch.no_grad():
-                    outputs = self.model(**stacked_inputs)
+                    outputs = self.model(pixel_values=stacked_tensor)
                     logits = outputs.logits
                     probabilities = F.softmax(logits, dim=1)
 
