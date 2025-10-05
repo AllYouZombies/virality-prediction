@@ -9,12 +9,17 @@ python-multipart
 scikit-video
 transformers  # Для предобученных моделей HuggingFace (ViViT поддержка)
 accelerate  # Для оптимизации GPU
-setuptools  # Для совместимости с Python 3.12
-av  # Для обработки видео в HuggingFace
-numpy
+av
 typing-extensions
 sympy
 networkx
 jinja2
 fsspec
 filelock
+huggingface-hub
+safetensors
+pyyaml
+regex
+requests
+tqdm
+packaging

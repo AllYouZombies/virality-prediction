@@ -6,6 +6,7 @@ from transformers import VivitImageProcessor, VivitForVideoClassification
 from .video_processor import VideoProcessor
 import os
 import numpy as np
+from typing import List
 
 
 class ViralityPredictor:
@@ -28,7 +29,8 @@ class ViralityPredictor:
         self.model.eval()
 
         # Инициализация процессора видео
-        self.video_processor = VideoProcessor()
+        # ViViT-B-16x2 ожидает 32 кадра
+        self.video_processor = VideoProcessor(target_frames=32)
 
         # Информация о GPU если доступен
         if torch.cuda.is_available():
@@ -134,3 +136,127 @@ class ViralityPredictor:
             recommendations.append("Сократите видео до 60 секунд или меньше")
 
         return recommendations
+
+    def predict_from_frames(self, frames: np.ndarray) -> dict:
+        """
+        Предсказание вирусности из уже извлеченных кадров.
+
+        Args:
+            frames: numpy array shape (num_frames, H, W, C)
+
+        Returns:
+            dict: Результаты предсказания
+        """
+        try:
+            # HuggingFace processor ожидает список numpy массивов
+            inputs = self.image_processor(list(frames), return_tensors="pt")
+
+            # Переносим на device
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            # Предсказание
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                logits = outputs.logits
+                probabilities = F.softmax(logits, dim=1)
+
+                # Получаем вероятности для каждого класса
+                non_viral_prob = probabilities[0, 0].item()
+                viral_prob = probabilities[0, 1].item()
+
+                # Определяем класс
+                predicted_class = torch.argmax(probabilities, dim=1).item()
+                is_viral = predicted_class == 1
+
+            # Вычисляем оценку вирусности (0-100)
+            virality_score = int(viral_prob * 100)
+
+            return {
+                'success': True,
+                'virality_score': virality_score,
+                'is_viral': is_viral,
+                'probabilities': {
+                    'non_viral': round(non_viral_prob, 4),
+                    'viral': round(viral_prob, 4)
+                },
+                'confidence': round(max(non_viral_prob, viral_prob), 4)
+            }
+
+        except Exception as e:
+            print(f"Ошибка предсказания: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
+    def predict_batch(self, frames_list: List[np.ndarray], batch_size: int = 4) -> List[dict]:
+        """
+        Батч-предсказание для нескольких наборов кадров.
+        Обрабатывает несколько видео одновременно на GPU для ускорения.
+
+        Args:
+            frames_list: Список numpy arrays, каждый shape (num_frames, H, W, C)
+            batch_size: Размер батча для обработки на GPU
+
+        Returns:
+            List[dict]: Список результатов предсказаний
+        """
+        results = []
+
+        try:
+            # Обрабатываем батчами
+            for i in range(0, len(frames_list), batch_size):
+                batch = frames_list[i:i + batch_size]
+
+                # Подготавливаем все фреймы в батче
+                batch_inputs = []
+                for frames in batch:
+                    inputs = self.image_processor(list(frames), return_tensors="pt")
+                    batch_inputs.append(inputs)
+
+                # Стакаем в один батч
+                # Все inputs должны иметь одинаковую размерность
+                stacked_inputs = {
+                    k: torch.cat([inp[k] for inp in batch_inputs], dim=0).to(self.device)
+                    for k in batch_inputs[0].keys()
+                }
+
+                # Предсказание для батча
+                with torch.no_grad():
+                    outputs = self.model(**stacked_inputs)
+                    logits = outputs.logits
+                    probabilities = F.softmax(logits, dim=1)
+
+                    # Обрабатываем каждый результат в батче
+                    for j in range(len(batch)):
+                        non_viral_prob = probabilities[j, 0].item()
+                        viral_prob = probabilities[j, 1].item()
+                        predicted_class = torch.argmax(probabilities[j]).item()
+                        is_viral = predicted_class == 1
+                        virality_score = int(viral_prob * 100)
+
+                        results.append({
+                            'success': True,
+                            'virality_score': virality_score,
+                            'is_viral': is_viral,
+                            'probabilities': {
+                                'non_viral': round(non_viral_prob, 4),
+                                'viral': round(viral_prob, 4)
+                            },
+                            'confidence': round(max(non_viral_prob, viral_prob), 4)
+                        })
+
+        except Exception as e:
+            print(f"Ошибка батч-предсказания: {e}")
+            import traceback
+            traceback.print_exc()
+            # Возвращаем ошибки для всех элементов батча
+            for _ in range(len(frames_list) - len(results)):
+                results.append({
+                    'success': False,
+                    'error': str(e)
+                })
+
+        return results

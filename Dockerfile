@@ -1,37 +1,40 @@
-# virality-prediction/Dockerfile (обновленная версия)
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
-RUN apt-get update && apt-get install -y \
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
+    python3-venv \
     ffmpeg \
     libsm6 \
     libxext6 \
     libxrender-dev \
     libgomp1 \
-    wget \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && python3 -m venv /opt/venv
+
+ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 
-# PyTorch nightly с CUDA 12.4 для поддержки новых GPU (compute capability 12.0)
-RUN pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu130 --no-deps
+# СНАЧАЛА устанавливаем PyTorch nightly
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# ЗАТЕМ устанавливаем остальные зависимости
+# PyTorch уже установлен, поэтому зависимости не будут тянуть стабильную версию
+RUN --mount=type=bind,source=requirements.txt,target=/app/requirements.txt \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir -r requirements.txt
 
-# Копируем код
 COPY app/ /app/app/
 COPY ViViT/ /app/ViViT/
 
-# Создаем необходимые директории
 RUN mkdir -p /app/models /app/uploads
 
-# Скрипт для создания демо-модели если нужно
 COPY create_demo_model.py /app/
 
-# Создаем entrypoint скрипт
 RUN echo '#!/bin/bash\n\
 if [ ! -f /app/models/vivit_model.pth ]; then\n\
     echo "Модель не найдена, создаем демо-модель..."\n\
