@@ -15,20 +15,15 @@ RUN --mount=type=cache,target=/var/cache/apt \
     libgomp1 \
     curl
 
-# Устанавливаем pipenv
+# Copy requirements and install Python dependencies
+COPY requirements.txt /app/
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install pipenv
-
-# Pipenv правильно разрешает зависимости с учетом источников
-RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=bind,source=./Pipfile.lock,target=/app/Pipfile.lock \
-    PIPENV_VENV_IN_PROJECT=1 pipenv install --deploy --ignore-pipfile
-
-# Активируем виртуальное окружение pipenv
-ENV PATH="/app/.venv/bin:$PATH"
+    pip install --break-system-packages --no-cache-dir -r requirements.txt
 
 COPY app/ /app/app/
 
 RUN mkdir -p /app/models
 
 EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

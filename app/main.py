@@ -8,7 +8,9 @@ import os
 import shutil
 from .predictor import ViralityPredictor
 from .speech_detector import SpeechDetector
+from .speech_transcriber import SpeechTranscriber
 from .trimming_optimizer_v2 import TrimmingOptimizerV2
+from .videollama3_analyzer import VideoLLaMA3Analyzer
 import logging
 import torch
 from concurrent.futures import ThreadPoolExecutor
@@ -42,8 +44,12 @@ app.add_middleware(
 # Инициализация предиктора
 predictor = ViralityPredictor(model_path="/app/models/model.pth")
 
-# Инициализация детектора речи и оптимизатора
+# Инициализация детектора речи, транскрибера и оптимизатора
 speech_detector = SpeechDetector()
+speech_transcriber = SpeechTranscriber(model_size="base")  # base - баланс скорости и качества
+
+# Инициализация VideoLLaMA3 для глубокого анализа вирусности
+videollama3_analyzer = None  # Ленивая инициализация при первом использовании
 
 trimming_optimizer = TrimmingOptimizerV2(
     target_duration=60.0,
@@ -467,7 +473,7 @@ async def analyze_timeline_path(request: AnalyzeTimelinePathRequest):
             )
             all_frames.append(frames)
 
-        # Батч-предсказание
+        # Батч-предсказание с VideoMAE (быстрая оценка)
         logger.info(f"Running batch prediction with batch_size={batch_size}...")
         predictions = predictor.predict_batch(all_frames, batch_size=batch_size)
 
@@ -493,10 +499,81 @@ async def analyze_timeline_path(request: AnalyzeTimelinePathRequest):
             else:
                 logger.warning(f"Failed prediction for window at {window['start']}s: {prediction.get('error')}")
 
-        # Сортируем по score и берем топ-N
-        top_segments = sorted(results, key=lambda x: x['score'], reverse=True)[:top_n]
+        # Сортируем по score и берем предварительный топ (2x для VideoLLaMA3 анализа)
+        preliminary_top = sorted(results, key=lambda x: x['score'], reverse=True)[:top_n * 2]
 
-        logger.info(f"Analysis complete. Found {len(results)} segments, returning top {len(top_segments)}")
+        # Глубокий анализ топовых сегментов с VideoLLaMA3
+        logger.info(f"Running deep VideoLLaMA3 analysis on top {len(preliminary_top)} segments...")
+
+        global videollama3_analyzer
+        if videollama3_analyzer is None:
+            try:
+                logger.info("Initializing VideoLLaMA3 analyzer...")
+                videollama3_analyzer = VideoLLaMA3Analyzer()
+            except Exception as e:
+                logger.warning(f"Failed to initialize VideoLLaMA3: {e}. Using VideoMAE scores only.")
+
+        # Анализируем каждый топовый сегмент с VideoLLaMA3
+        for segment in preliminary_top:
+            if videollama3_analyzer is not None:
+                try:
+                    # Создаём временный файл с сегментом для анализа
+                    import subprocess
+                    segment_path = f"/tmp/segment_{segment['start']}_{segment['end']}.mp4"
+
+                    # Вырезаем сегмент с помощью ffmpeg
+                    subprocess.run([
+                        'ffmpeg', '-y', '-i', video_path,
+                        '-ss', str(segment['start']),
+                        '-t', str(segment['duration']),
+                        '-c', 'copy',
+                        segment_path
+                    ], capture_output=True, check=True)
+
+                    # Анализируем с VideoLLaMA3
+                    llama_analysis = videollama3_analyzer.analyze_virality(
+                        segment_path,
+                        max_frames=128,
+                        fps=1
+                    )
+
+                    # Удаляем временный файл
+                    os.unlink(segment_path)
+
+                    # Объединяем scores: 60% VideoLLaMA3 + 40% VideoMAE
+                    combined_score = int(
+                        llama_analysis['virality_score'] * 0.6 +
+                        segment['score'] * 0.4
+                    )
+
+                    # Обновляем segment с данными VideoLLaMA3
+                    segment['score'] = combined_score
+                    segment['videollama3'] = {
+                        'virality_score': llama_analysis['virality_score'],
+                        'hook_quality': llama_analysis['hook_quality'],
+                        'engagement_potential': llama_analysis['engagement_potential'],
+                        'viral_elements': llama_analysis['viral_elements'],
+                        'reasoning': llama_analysis['reasoning'],
+                        'recommendation': llama_analysis['recommendation']
+                    }
+                    segment['analysis_method'] = 'VideoMAE + VideoLLaMA3'
+
+                    logger.info(f"Segment {segment['start']}-{segment['end']}s: "
+                               f"VideoMAE={segment.get('videollama3', {}).get('virality_score', 'N/A')}, "
+                               f"VideoLLaMA3={llama_analysis['virality_score']}, "
+                               f"Combined={combined_score}")
+
+                except Exception as e:
+                    logger.warning(f"VideoLLaMA3 analysis failed for segment {segment['start']}s: {e}")
+                    segment['analysis_method'] = 'VideoMAE only'
+                    segment['videollama3_error'] = str(e)
+            else:
+                segment['analysis_method'] = 'VideoMAE only'
+
+        # Пересортировываем по обновленным scores и берем финальный топ-N
+        top_segments = sorted(preliminary_top, key=lambda x: x['score'], reverse=True)[:top_n]
+
+        logger.info(f"Analysis complete. Found {len(results)} segments, deep-analyzed {len(preliminary_top)}, returning top {len(top_segments)}")
 
         return JSONResponse(content={
             'success': True,
@@ -778,52 +855,87 @@ async def generate_metadata(request: GenerateMetadataRequest):
 
         logger.info(f"Generating metadata for {output_path}, score={score}, duration={duration:.1f}s")
 
-        # Извлекаем первый кадр из видео
-        cap = cv2.VideoCapture(video_path)
-        ret, frame = cap.read()
+        # Извлекаем несколько ключевых кадров из ОБРАБОТАННОГО видео для полного анализа
+        cap = cv2.VideoCapture(output_path)
+
+        # Получаем общее количество кадров и FPS
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        video_duration = total_frames / fps if fps > 0 else duration
+
+        # Берем 4 ключевых момента: начало, 1/3, 2/3, конец
+        frame_positions = [0, int(total_frames * 0.33), int(total_frames * 0.66), max(0, total_frames - 1)]
+
+        frames_base64 = []
+        max_size = 512
+
+        for frame_idx in frame_positions:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+
+            if ret:
+                # Конвертируем кадр в base64
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(frame_rgb)
+
+                # Resize для экономии памяти (max 512px по длинной стороне)
+                ratio = min(max_size / pil_image.width, max_size / pil_image.height)
+                if ratio < 1:
+                    new_size = (int(pil_image.width * ratio), int(pil_image.height * ratio))
+                    pil_image = pil_image.resize(new_size, Image.Resampling.LANCZOS)
+
+                buffered = io.BytesIO()
+                pil_image.save(buffered, format="JPEG", quality=85)
+                img_base64 = base64.b64encode(buffered.getvalue()).decode()
+                frames_base64.append(img_base64)
+
         cap.release()
 
-        if not ret:
-            raise HTTPException(status_code=400, detail="Failed to extract frame from video")
+        if not frames_base64:
+            raise HTTPException(status_code=400, detail="Failed to extract frames from processed video")
 
-        # Конвертируем кадр в base64
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(frame_rgb)
+        logger.info(f"Extracted {len(frames_base64)} keyframes for analysis")
 
-        # Resize для экономии памяти (max 512px по длинной стороне)
-        max_size = 512
-        ratio = min(max_size / pil_image.width, max_size / pil_image.height)
-        if ratio < 1:
-            new_size = (int(pil_image.width * ratio), int(pil_image.height * ratio))
-            pil_image = pil_image.resize(new_size, Image.Resampling.LANCZOS)
+        # Транскрибируем речь из видео
+        transcription = ""
+        try:
+            logger.info("Transcribing speech from video...")
+            transcription = speech_transcriber.transcribe(output_path, language="ru")
+            if transcription:
+                logger.info(f"Transcription complete: {len(transcription)} chars")
+            else:
+                logger.warning("No speech detected in video")
+        except Exception as e:
+            logger.error(f"Transcription error: {e}")
+            transcription = ""
 
-        buffered = io.BytesIO()
-        pil_image.save(buffered, format="JPEG", quality=85)
-        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+        # Формируем промпт для Ollama с транскрипцией
+        speech_context = f"\n\nТЕКСТ ИЗ ВИДЕО:\n{transcription}" if transcription else ""
 
-        # Формируем промпт для Ollama
-        prompt = f"""Ты эксперт по вирусному контенту YouTube Shorts. Проанализируй это видео и сгенерируй:
+        prompt = f"""Ты эксперт по вирусному контенту YouTube Shorts. Тебе даны 4 ключевых кадра из видео (начало, треть, две трети, конец){' и текст речи из видео' if transcription else ''}. Проанализируй весь контент видео и сгенерируй:
 
 1. ВИРУСНОЕ НАЗВАНИЕ (до 100 символов):
    - Должно цеплять внимание
    - Использовать триггерные слова
    - НЕ использовать emoji
+   - Отражать ключевые моменты из всех кадров
 
 2. ОПИСАНИЕ С ХЭШТЕГАМИ (до 200 символов):
-   - Краткое описание контента
+   - Краткое описание контента всего ролика
    - 10-12 релевантных трендовых хештегов для YouTube Shorts
    - Хештеги на русском и английском
 
 Параметры видео:
 - Длительность: {duration:.0f} секунд
 - Вирусность (AI score): {score}/100
+- Ключевые кадры: начало → треть → две трети → конец{speech_context}
 
 Формат ответа (строго):
 TITLE: [название без кавычек]
 DESCRIPTION: [описание]
 HASHTAGS: [#хештег1 #хештег2 ... через пробел]"""
 
-        # Отправляем запрос в Ollama
+        # Отправляем запрос в Ollama со всеми кадрами
         ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
         response = requests.post(
@@ -831,7 +943,7 @@ HASHTAGS: [#хештег1 #хештег2 ... через пробел]"""
             json={
                 "model": "qwen2.5vl:7b",
                 "prompt": prompt,
-                "images": [img_base64],
+                "images": frames_base64,  # Передаем все 4 кадра
                 "stream": False,
                 "options": {
                     "temperature": 0.7,
@@ -839,7 +951,7 @@ HASHTAGS: [#хештег1 #хештег2 ... через пробел]"""
                     "max_tokens": 500
                 }
             },
-            timeout=60
+            timeout=120  # Увеличили timeout для обработки нескольких кадров
         )
 
         if response.status_code != 200:

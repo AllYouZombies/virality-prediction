@@ -1,0 +1,37 @@
+# PyTorch nightly with CUDA 12.8
+--extra-index-url https://download.pytorch.org/whl/nightly/cu128
+torch
+torchvision
+torchaudio
+pytorch-triton
+
+# FastAPI
+fastapi
+uvicorn[standard]
+
+# Transformers and ML
+transformers
+accelerate
+timm
+einops
+sentencepiece
+protobuf
+
+# Video processing
+opencv-python
+moviepy
+av
+decord
+scikit-video
+
+# Audio processing
+soundfile
+librosa
+
+# Speech-to-text
+openai-whisper
+
+# Utilities
+python-multipart
+requests
+pillow
