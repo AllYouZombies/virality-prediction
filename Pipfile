@@ -38,6 +38,8 @@ librosa = "*"
 
 # Утилиты
 python-multipart = "*"
+requests = "*"
+pillow = "*"
 
 [dev-packages]
 

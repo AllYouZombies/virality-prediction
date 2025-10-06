@@ -13,6 +13,11 @@ import logging
 import torch
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
+import requests
+import base64
+import cv2
+from PIL import Image
+import io
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -748,6 +753,160 @@ async def predict_from_url(video_url: str):
         "url": video_url,
         "note": "Требует дополнительной реализации"
     }
+
+
+class GenerateMetadataRequest(BaseModel):
+    video_path: str
+    virality_score: int
+    duration: float
+    output_path: str  # Путь к выходному MP4 файлу
+
+
+@app.post("/generate_metadata")
+async def generate_metadata(request: GenerateMetadataRequest):
+    """
+    Генерирует название и описание для YouTube Shorts используя Qwen2.5-VL через Ollama.
+    Сохраняет два текстовых файла рядом с видео:
+    - {output_path}_title.txt - название ролика
+    - {output_path}_description.txt - описание с хештегами
+    """
+    try:
+        video_path = request.video_path
+        score = request.virality_score
+        duration = request.duration
+        output_path = request.output_path
+
+        logger.info(f"Generating metadata for {output_path}, score={score}, duration={duration:.1f}s")
+
+        # Извлекаем первый кадр из видео
+        cap = cv2.VideoCapture(video_path)
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret:
+            raise HTTPException(status_code=400, detail="Failed to extract frame from video")
+
+        # Конвертируем кадр в base64
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+
+        # Resize для экономии памяти (max 512px по длинной стороне)
+        max_size = 512
+        ratio = min(max_size / pil_image.width, max_size / pil_image.height)
+        if ratio < 1:
+            new_size = (int(pil_image.width * ratio), int(pil_image.height * ratio))
+            pil_image = pil_image.resize(new_size, Image.Resampling.LANCZOS)
+
+        buffered = io.BytesIO()
+        pil_image.save(buffered, format="JPEG", quality=85)
+        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+
+        # Формируем промпт для Ollama
+        prompt = f"""Ты эксперт по вирусному контенту YouTube Shorts. Проанализируй это видео и сгенерируй:
+
+1. ВИРУСНОЕ НАЗВАНИЕ (до 100 символов):
+   - Должно цеплять внимание
+   - Использовать триггерные слова
+   - НЕ использовать emoji
+
+2. ОПИСАНИЕ С ХЭШТЕГАМИ (до 200 символов):
+   - Краткое описание контента
+   - 10-12 релевантных трендовых хештегов для YouTube Shorts
+   - Хештеги на русском и английском
+
+Параметры видео:
+- Длительность: {duration:.0f} секунд
+- Вирусность (AI score): {score}/100
+
+Формат ответа (строго):
+TITLE: [название без кавычек]
+DESCRIPTION: [описание]
+HASHTAGS: [#хештег1 #хештег2 ... через пробел]"""
+
+        # Отправляем запрос в Ollama
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
+        response = requests.post(
+            f"{ollama_host}/api/generate",
+            json={
+                "model": "qwen2.5vl:7b",
+                "prompt": prompt,
+                "images": [img_base64],
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "max_tokens": 500
+                }
+            },
+            timeout=60
+        )
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Ollama request failed: {response.text}")
+
+        result = response.json()
+        generated_text = result.get("response", "")
+
+        # Парсим ответ
+        lines = generated_text.strip().split('\n')
+        title = ""
+        description = ""
+        hashtags = ""
+
+        for line in lines:
+            line = line.strip()
+            if line.startswith("TITLE:"):
+                title = line.replace("TITLE:", "").strip()
+            elif line.startswith("DESCRIPTION:"):
+                description = line.replace("DESCRIPTION:", "").strip()
+            elif line.startswith("HASHTAGS:"):
+                hashtags = line.replace("HASHTAGS:", "").strip()
+
+        # Если парсинг не удался, используем весь текст как описание
+        if not title:
+            title = generated_text[:100].strip()
+
+        if not description:
+            description = generated_text.strip()
+
+        # Формируем финальное описание с хештегами
+        full_description = description
+        if hashtags:
+            full_description += f"\n\n{hashtags}"
+
+        # Определяем пути для текстовых файлов (убираем .mp4 и добавляем суффикс)
+        base_path = output_path.rsplit('.', 1)[0]
+        title_file = f"{base_path}_title.txt"
+        description_file = f"{base_path}_description.txt"
+
+        # Сохраняем файлы
+        with open(title_file, 'w', encoding='utf-8') as f:
+            f.write(title)
+
+        with open(description_file, 'w', encoding='utf-8') as f:
+            f.write(full_description)
+
+        logger.info(f"Metadata saved: {title_file}, {description_file}")
+
+        return JSONResponse(content={
+            'success': True,
+            'title': title,
+            'description': full_description,
+            'title_file': title_file,
+            'description_file': description_file,
+            'generated_text': generated_text
+        })
+
+    except requests.exceptions.Timeout:
+        logger.error("Ollama request timeout")
+        raise HTTPException(status_code=504, detail="Ollama request timeout")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Ollama request error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ollama request error: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error generating metadata: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

@@ -23,10 +23,12 @@ class TrimmingOptimizerV2:
         speech_gap_tolerance: float = 0.3  # 300 мс - допустимая пауза для обрезки
     ):
         self.target_duration = target_duration
+        self.max_duration = 59.0  # Максимальная длительность ролика
+        self.min_duration = 50.0  # Минимальная длительность ролика
         self.step_size = step_size
         self.speech_gap_tolerance = speech_gap_tolerance
-        logger.info(f"TrimmingOptimizerV2: target={target_duration}s, step={step_size}s, "
-                   f"speech_gap={speech_gap_tolerance}s")
+        logger.info(f"TrimmingOptimizerV2: target={target_duration}s, max={self.max_duration}s, "
+                   f"min={self.min_duration}s, step={step_size}s, speech_gap={speech_gap_tolerance}s")
 
     def optimize_segment(
         self,
@@ -48,10 +50,9 @@ class TrimmingOptimizerV2:
                 'avg_score': float
             }
         """
-        to_remove = window_duration - self.target_duration
-
-        if to_remove <= 0:
-            # Окно уже короче цели
+        # Проверяем, нужно ли обрезать видео
+        if window_duration <= self.max_duration:
+            # Окно уже в допустимом диапазоне (≤59 секунд)
             return {
                 'keep_ranges': [(window_start, window_start + window_duration)],
                 'remove_ranges': [],
@@ -59,6 +60,9 @@ class TrimmingOptimizerV2:
                 'removed_duration': 0,
                 'avg_score': np.mean([s['score'] for s in micro_segments])
             }
+
+        # Вычисляем, сколько нужно удалить для достижения max_duration (59 сек)
+        to_remove = window_duration - self.max_duration
 
         # Шаг 1: Группируем микро-сегменты в шаги
         steps = self._create_steps(micro_segments, window_start, window_duration)
@@ -88,6 +92,33 @@ class TrimmingOptimizerV2:
 
         final_duration = sum(e - s for s, e in keep_ranges)
         removed_duration = sum(e - s for s, e in remove_ranges)
+
+        # Проверяем, что итоговая длина не превышает max_duration
+        # Если превышает, удаляем еще один худший шаг
+        iteration = 0
+        while final_duration > self.max_duration and iteration < 10:
+            logger.warning(f"Final duration {final_duration:.1f}s exceeds max {self.max_duration}s, "
+                          f"removing additional step...")
+
+            # Находим оставшиеся шаги (не удаленные)
+            remaining_steps = [s for s in steps if not any(
+                s['start'] >= rm_start and s['end'] <= rm_end
+                for rm_start, rm_end in remove_ranges
+            )]
+
+            if not remaining_steps:
+                break
+
+            # Удаляем худший из оставшихся
+            worst_remaining = min(remaining_steps, key=lambda x: x['avg_score'])
+            remove_ranges.append((worst_remaining['start'], worst_remaining['end']))
+
+            # Пересчитываем
+            remove_ranges = sorted(remove_ranges, key=lambda x: x[0])
+            keep_ranges = self._compute_keep_ranges(window_start, window_duration, remove_ranges)
+            final_duration = sum(e - s for s, e in keep_ranges)
+            removed_duration = sum(e - s for s, e in remove_ranges)
+            iteration += 1
 
         # Вычисляем средний score ТОЛЬКО для сохраненных сегментов
         kept_segments = []
