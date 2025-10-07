@@ -10,7 +10,6 @@ from .predictor import ViralityPredictor
 from .speech_detector import SpeechDetector
 from .speech_transcriber import SpeechTranscriber
 from .trimming_optimizer_v2 import TrimmingOptimizerV2
-from .videollama3_analyzer import VideoLLaMA3Analyzer
 import logging
 import torch
 from concurrent.futures import ThreadPoolExecutor
@@ -47,9 +46,6 @@ predictor = ViralityPredictor(model_path="/app/models/model.pth")
 # Инициализация детектора речи, транскрибера и оптимизатора
 speech_detector = SpeechDetector()
 speech_transcriber = SpeechTranscriber(model_size="base")  # base - баланс скорости и качества
-
-# Инициализация VideoLLaMA3 для глубокого анализа вирусности
-videollama3_analyzer = None  # Ленивая инициализация при первом использовании
 
 trimming_optimizer = TrimmingOptimizerV2(
     target_duration=60.0,
@@ -499,81 +495,10 @@ async def analyze_timeline_path(request: AnalyzeTimelinePathRequest):
             else:
                 logger.warning(f"Failed prediction for window at {window['start']}s: {prediction.get('error')}")
 
-        # Сортируем по score и берем предварительный топ (2x для VideoLLaMA3 анализа)
-        preliminary_top = sorted(results, key=lambda x: x['score'], reverse=True)[:top_n * 2]
+        # Сортируем по score и берем топ-N
+        top_segments = sorted(results, key=lambda x: x['score'], reverse=True)[:top_n]
 
-        # Глубокий анализ топовых сегментов с VideoLLaMA3
-        logger.info(f"Running deep VideoLLaMA3 analysis on top {len(preliminary_top)} segments...")
-
-        global videollama3_analyzer
-        if videollama3_analyzer is None:
-            try:
-                logger.info("Initializing VideoLLaMA3 analyzer...")
-                videollama3_analyzer = VideoLLaMA3Analyzer()
-            except Exception as e:
-                logger.warning(f"Failed to initialize VideoLLaMA3: {e}. Using VideoMAE scores only.")
-
-        # Анализируем каждый топовый сегмент с VideoLLaMA3
-        for segment in preliminary_top:
-            if videollama3_analyzer is not None:
-                try:
-                    # Создаём временный файл с сегментом для анализа
-                    import subprocess
-                    segment_path = f"/tmp/segment_{segment['start']}_{segment['end']}.mp4"
-
-                    # Вырезаем сегмент с помощью ffmpeg
-                    subprocess.run([
-                        'ffmpeg', '-y', '-i', video_path,
-                        '-ss', str(segment['start']),
-                        '-t', str(segment['duration']),
-                        '-c', 'copy',
-                        segment_path
-                    ], capture_output=True, check=True)
-
-                    # Анализируем с VideoLLaMA3
-                    llama_analysis = videollama3_analyzer.analyze_virality(
-                        segment_path,
-                        max_frames=128,
-                        fps=1
-                    )
-
-                    # Удаляем временный файл
-                    os.unlink(segment_path)
-
-                    # Объединяем scores: 60% VideoLLaMA3 + 40% VideoMAE
-                    combined_score = int(
-                        llama_analysis['virality_score'] * 0.6 +
-                        segment['score'] * 0.4
-                    )
-
-                    # Обновляем segment с данными VideoLLaMA3
-                    segment['score'] = combined_score
-                    segment['videollama3'] = {
-                        'virality_score': llama_analysis['virality_score'],
-                        'hook_quality': llama_analysis['hook_quality'],
-                        'engagement_potential': llama_analysis['engagement_potential'],
-                        'viral_elements': llama_analysis['viral_elements'],
-                        'reasoning': llama_analysis['reasoning'],
-                        'recommendation': llama_analysis['recommendation']
-                    }
-                    segment['analysis_method'] = 'VideoMAE + VideoLLaMA3'
-
-                    logger.info(f"Segment {segment['start']}-{segment['end']}s: "
-                               f"VideoMAE={segment.get('videollama3', {}).get('virality_score', 'N/A')}, "
-                               f"VideoLLaMA3={llama_analysis['virality_score']}, "
-                               f"Combined={combined_score}")
-
-                except Exception as e:
-                    logger.warning(f"VideoLLaMA3 analysis failed for segment {segment['start']}s: {e}")
-                    segment['analysis_method'] = 'VideoMAE only'
-                    segment['videollama3_error'] = str(e)
-            else:
-                segment['analysis_method'] = 'VideoMAE only'
-
-        # Пересортировываем по обновленным scores и берем финальный топ-N
-        top_segments = sorted(preliminary_top, key=lambda x: x['score'], reverse=True)[:top_n]
-
-        logger.info(f"Analysis complete. Found {len(results)} segments, deep-analyzed {len(preliminary_top)}, returning top {len(top_segments)}")
+        logger.info(f"Analysis complete. Found {len(results)} segments, returning top {len(top_segments)}")
 
         return JSONResponse(content={
             'success': True,
@@ -998,6 +923,10 @@ HASHTAGS: [#хештег1 #хештег2 ... через пробел]"""
 
         with open(description_file, 'w', encoding='utf-8') as f:
             f.write(full_description)
+
+        # Устанавливаем права 644 (rw-r--r--) для чтения из n8n контейнера
+        os.chmod(title_file, 0o644)
+        os.chmod(description_file, 0o644)
 
         logger.info(f"Metadata saved: {title_file}, {description_file}")
 
